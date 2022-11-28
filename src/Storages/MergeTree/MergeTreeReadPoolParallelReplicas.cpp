@@ -109,23 +109,15 @@ MergeTreeReadTaskPtr MergeTreeReadPoolParallelReplicas::getTask()
     if (no_more_tasks_available)
         return nullptr;
 
-    std::cout << "Requested a task" << std::endl;
-
     if (buffered_ranges.empty() && future_response.valid())
     {
         auto result = future_response.get();
-
-        std::cout << "Going to collaborate with initiator" << std::endl;
 
         if (!result || result->finish)
         {
             no_more_tasks_available = true;
             return nullptr;
         }
-
-        WriteBufferFromOwnString ss;
-        result->describe(ss);
-        std::cout << "Got answer " << ss.str() << std::endl;
 
         buffered_ranges = std::move(result->description);
     }
@@ -178,12 +170,6 @@ MergeTreeReadTaskPtr MergeTreeReadPoolParallelReplicas::getTask()
     auto curr_task_size_predictor
         = !per_part.size_predictor ? nullptr : std::make_unique<MergeTreeBlockSizePredictor>(*per_part.size_predictor); /// make a copy
 
-    std::cout << "Will read from part {}" << part.data_part->info.getPartName() << std::endl;
-    for (auto & range : ranges_to_read)
-    {
-        std::cout << range.begin << ' ' << range.end << std::endl;
-    }
-
     if (buffered_ranges.empty())
         sendRequest();
 
@@ -205,34 +191,51 @@ MarkRanges MergeTreeInOrderReadPoolParallelReplicas::getNewTask(RangesInDataPart
 {
     std::lock_guard lock(mutex);
 
-    LOG_TRACE(&Poco::Logger::get("MergeTreeInOrderReadPoolParallelReplicas"), "Get new task!");
+    auto get_from_buffer = [&]() -> std::optional<MarkRanges>
+    {
+        for (auto & desc : buffered_tasks)
+        {
+            if (desc.info == description.info && !desc.ranges.empty())
+            {
+                auto result = std::move(desc.ranges);
+                desc.ranges = MarkRanges{};
+                return result;
+            }
+        }
+        return std::nullopt;
+    };
 
-    RangesInDataPartsDescription descriptions;
-    descriptions.emplace_back(description);
+    if (auto result = get_from_buffer(); result)
+        return result.value();
 
-    auto result = extension.callback(ParallelReadRequest{
+    if (no_more_tasks)
+        return {};
+
+    auto response = extension.callback(ParallelReadRequest{
         .mode = mode,
         .replica_num = extension.number_of_current_replica,
-        .min_number_of_marks = 100, // FIXME
-        .description = descriptions,
+        .min_number_of_marks = min_marks_for_concurrent_read * request.size(),
+        .description = request,
     });
 
-    if (!result)
+    if (!response || response->description.empty() || response->finish)
     {
+        no_more_tasks = true;
         return {};
     }
 
-    if (result->description.empty())
+    /// Fill the buffer
+    for (size_t i = 0; i < request.size(); ++i)
     {
-        return {};
+        auto & new_ranges = response->description[i].ranges;
+        auto & old_ranges = buffered_tasks[i].ranges;
+        std::move(new_ranges.begin(), new_ranges.end(), std::back_inserter(old_ranges));
     }
 
-    if (result->finish)
-    {
-        return {};
-    }
+    if (auto result = get_from_buffer(); result)
+        return result.value();
 
-    return result->description[0].ranges;
+    return {};
 }
 
 }

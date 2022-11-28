@@ -39,57 +39,17 @@ try
 
     if (pool)
     {
-        // size_t current_sum_marks = 0;
-        // size_t max_marks = 100;
-
-        // while (!all_mark_ranges.empty() && current_sum_marks < max_marks)
-        // {
-        //     auto current_range = all_mark_ranges.front();
-        //     all_mark_ranges.pop_front();
-        //     auto gap = max_marks - current_sum_marks;
-        //     if (current_range.getNumberOfMarks() <= gap)
-        //     {
-        //         mark_ranges_for_task.emplace_back(current_range);
-        //         current_sum_marks += current_range.getNumberOfMarks();
-        //         continue;
-        //     }
-
-        //     auto new_range = current_range;
-        //     new_range.end = new_range.begin + gap;
-        //     current_range.begin += gap;
-        //     current_sum_marks += gap;
-        //     mark_ranges_for_task.emplace_back(new_range);
-        //     all_mark_ranges.emplace_front(current_range);
-        // }
-
         auto description = RangesInDataPartDescription{
             .info = data_part->info,
-            .ranges = mark_ranges_for_task,
+            /// We just ignore all the distribution done before
+            /// Everything will be done on coordinator side
+            .ranges = {},
         };
 
         mark_ranges_for_task = pool->getNewTask(description);
 
         if (mark_ranges_for_task.empty())
             return false;
-
-        /// We need to subtract new ranges from all ranges we have now
-        auto current_ranges = HalfIntervals::initializeFromMarkRanges(all_mark_ranges);
-        current_ranges.intersect(HalfIntervals::initializeFromMarkRanges(mark_ranges_for_task).negate());
-        all_mark_ranges = current_ranges.convertToMarkRangesFinal();
-
-        // std::sort(mark_ranges_for_task.begin(), mark_ranges_for_task.end());
-        // std::sort(all_mark_ranges.begin(), all_mark_ranges.end());
-
-        // while (!all_mark_ranges.empty())
-        // {
-        //     auto current_range = all_mark_ranges.front();
-        //     if (current_range.begin >= mark_ranges_for_task.back().end)
-        //     {
-        //         all_mark_ranges.pop_front();
-        //         continue;
-        //     }
-        //     break;
-        // }
     }
 
     auto size_predictor = (preferred_block_size_bytes == 0) ? nullptr

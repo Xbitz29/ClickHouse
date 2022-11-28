@@ -596,8 +596,11 @@ Pipe ReadFromMergeTree::spreadMarkRangesAmongStreamsWithOrder(
             .colums_to_read = column_names
         };
 
-        pool = std::make_shared<MergeTreeInOrderReadPoolParallelReplicas>(parts_with_ranges, extension,
-            read_type == ReadFromMergeTree::ReadType::InOrder ? CoordinationMode::WithOrder : CoordinationMode::ReverseOrder);
+        pool = std::make_shared<MergeTreeInOrderReadPoolParallelReplicas>(
+            parts_with_ranges,
+            extension,
+            read_type == ReadFromMergeTree::ReadType::InOrder ? CoordinationMode::WithOrder : CoordinationMode::ReverseOrder,
+            info.min_marks_for_concurrent_read);
     }
 
 

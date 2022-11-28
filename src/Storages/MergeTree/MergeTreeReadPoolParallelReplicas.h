@@ -113,17 +113,30 @@ public:
     MergeTreeInOrderReadPoolParallelReplicas(
         RangesInDataParts parts_,
         ParallelReadingExtension extension_,
-        CoordinationMode mode_)
+        CoordinationMode mode_,
+        size_t min_marks_for_concurrent_read_)
     : parts_ranges(parts_)
     , extension(extension_)
     , mode(mode_)
-    {}
+    , min_marks_for_concurrent_read(min_marks_for_concurrent_read_)
+    {
+        for (const auto & part : parts_ranges)
+            request.push_back({part.data_part->info, MarkRanges{}});
+
+        for (const auto & part : parts_ranges)
+            buffered_tasks.push_back({part.data_part->info, MarkRanges{}});
+    }
 
     MarkRanges getNewTask(RangesInDataPartDescription description);
 
     RangesInDataParts parts_ranges;
     ParallelReadingExtension extension;
     CoordinationMode mode;
+    size_t min_marks_for_concurrent_read{0};
+
+    bool no_more_tasks{false};
+    RangesInDataPartsDescription request;
+    RangesInDataPartsDescription buffered_tasks;
 
     std::mutex mutex;
     std::condition_variable can_go;

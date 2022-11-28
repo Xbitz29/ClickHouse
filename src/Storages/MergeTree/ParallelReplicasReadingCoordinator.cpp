@@ -33,6 +33,20 @@ namespace DB
 class ParallelReplicasReadingCoordinator::ImplInterface
 {
 public:
+    struct Stat
+    {
+        size_t number_of_requests{0};
+        size_t sum_marks{0};
+    };
+    using Stats = std::vector<Stat>;
+    static String toString(Stats stats)
+    {
+        String result = "Statistics: ";
+        for (size_t i = 0; i < stats.size(); ++i)
+            result += fmt::format("-- replica {}, requsts: {} marks: {} ", i, stats[i].number_of_requests, stats[i].sum_marks);
+        return result;
+    }
+
     virtual ~ImplInterface() = default;
     virtual ParallelReadResponse handleRequest(ParallelReadRequest request) = 0;
     virtual void handleInitialAllRangesAnnouncement(InitialAllRangesAnnouncement announcement) = 0;
@@ -45,8 +59,6 @@ struct Part
     // FIXME: This is needed to put this struct in set
     // and modify through iterator
     mutable std::set<size_t> replicas;
-
-    bool reading_started{false};
 
     bool operator<(const Part & rhs) const { return description.info < rhs.description.info; }
 };
@@ -67,8 +79,6 @@ public:
         , reading_state(replicas_count_)
         , stats(replicas_count_)
     {
-        LOG_TRACE(&Poco::Logger::get("Anime"), "Constructed a coordinator");
-
     }
 
     ~DefaultCoordinator() override;
@@ -95,14 +105,6 @@ public:
     std::vector<PartRefs> reading_state;
 
     Poco::Logger * log = &Poco::Logger::get("DefaultCoordinator");
-
-    struct Stat
-    {
-        size_t number_of_requests{0};
-        size_t sum_marks{0};
-    };
-
-    using Stats = std::vector<Stat>;
     Stats stats;
 
     std::atomic<bool> state_initialized{false};
@@ -125,12 +127,7 @@ public:
 
 DefaultCoordinator::~DefaultCoordinator()
 {
-    String result = "Coordination done. Statistics: ";
-    for (size_t i = 0; i < stats.size(); ++i)
-    {
-        result += fmt::format("-- replica {}, requsts: {} marks: {} ", i, stats[i].number_of_requests, stats[i].sum_marks);
-    }
-    LOG_TRACE(&Poco::Logger::get("Anime"), "{}", result);
+    LOG_TRACE(log, "Coordination done: {}", toString(stats));
 }
 
 void DefaultCoordinator::updateReadingState(const InitialAllRangesAnnouncement & announcement)
@@ -331,12 +328,18 @@ template <CoordinationMode mode>
 class InOrderCoordinator : public ParallelReplicasReadingCoordinator::ImplInterface
 {
 public:
-    explicit InOrderCoordinator( [[ maybe_unused ]] size_t replicas_count_) {}
-    ~InOrderCoordinator() override = default;
+    explicit InOrderCoordinator( [[ maybe_unused ]] size_t replicas_count_)
+        : stats(replicas_count_)
+    {}
+    ~InOrderCoordinator() override
+    {
+        LOG_TRACE(log, "Coordination done: {}", toString(stats));
+    }
 
     ParallelReadResponse handleRequest([[ maybe_unused ]]  ParallelReadRequest request) override;
     void handleInitialAllRangesAnnouncement([[ maybe_unused ]]  InitialAllRangesAnnouncement announcement) override;
 
+    Stats stats;
     Parts all_parts_to_read;
 
     Poco::Logger * log = &Poco::Logger::get(fmt::format("{}{}", magic_enum::enum_name(mode), "Coordinator"));
@@ -380,7 +383,9 @@ void InOrderCoordinator<mode>::handleInitialAllRangesAnnouncement(InitialAllRang
             .replicas = {announcement.replica_num}
         };
 
-        all_parts_to_read.insert(new_part);
+        auto insert_it = all_parts_to_read.insert(new_part);
+        auto & ranges = insert_it.first->description.ranges;
+        std::sort(ranges.begin(), ranges.end());
     }
 }
 
@@ -415,41 +420,33 @@ ParallelReadResponse InOrderCoordinator<mode>::handleRequest(ParallelReadRequest
         if (!global_part_it->replicas.contains(request.replica_num))
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Part {} doesn't exist on replica {} according to the global state", part.info.getPartName(), request.replica_num);
 
-        auto current_ranges = HalfIntervals::initializeFromMarkRanges(global_part_it->description.ranges);
-        auto allowed_ranges = current_ranges.intersect(HalfIntervals::initializeFromMarkRanges(part.ranges));
-
-        part.ranges = allowed_ranges.convertToMarkRangesFinal();
-        auto current_mark_size = part.ranges.getNumberOfMarks();
-
-        auto new_global_ranges = HalfIntervals::initializeFromMarkRanges(global_part_it->description.ranges).intersect(allowed_ranges.negate());
-        global_part_it->description.ranges = new_global_ranges.convertToMarkRangesFinal();
+        size_t current_mark_size = 0;
 
         /// Now we can recommend to read more intervals
-        // if constexpr (mode == CoordinationMode::ReverseOrder)
-        // {
-        //     while (!global_part_it->description.ranges.empty() && current_mark_size < request.min_number_of_marks)
-        //     {
-        //         auto range = global_part_it->description.ranges.back();
+        if constexpr (mode == CoordinationMode::ReverseOrder)
+        {
+            while (!global_part_it->description.ranges.empty() && current_mark_size < request.min_number_of_marks)
+            {
+                auto range = global_part_it->description.ranges.back();
 
-        //         auto gap = request.min_number_of_marks - current_mark_size;
-        //         if (range.getNumberOfMarks() > gap)
-        //         {
-        //             auto new_range = range;
-        //             range.end -= request.min_number_of_marks;
-        //             new_range.begin = new_range.end - request.min_number_of_marks;
+                if (range.getNumberOfMarks() > request.min_number_of_marks)
+                {
+                    auto new_range = range;
+                    range.end -= request.min_number_of_marks;
+                    new_range.begin = new_range.end - request.min_number_of_marks;
 
-        //             global_part_it->description.ranges.back() = range;
+                    global_part_it->description.ranges.back() = range;
 
-        //             part.ranges.emplace_front(new_range);
-        //             current_mark_size += new_range.getNumberOfMarks();
-        //             continue;
-        //         }
+                    part.ranges.emplace_front(new_range);
+                    current_mark_size += new_range.getNumberOfMarks();
+                    continue;
+                }
 
-        //         current_mark_size += global_part_it->description.ranges.back().getNumberOfMarks();
-        //         part.ranges.emplace_front(global_part_it->description.ranges.back());
-        //         global_part_it->description.ranges.pop_back();
-        //     }
-        // }
+                current_mark_size += global_part_it->description.ranges.back().getNumberOfMarks();
+                part.ranges.emplace_front(global_part_it->description.ranges.back());
+                global_part_it->description.ranges.pop_back();
+            }
+        }
 
         if (mode == CoordinationMode::WithOrder)
         {
@@ -481,6 +478,9 @@ ParallelReadResponse InOrderCoordinator<mode>::handleRequest(ParallelReadRequest
 
     if (!overall_number_of_marks)
         response.finish = true;
+
+    stats[request.replica_num].number_of_requests += 1;
+    stats[request.replica_num].sum_marks += overall_number_of_marks;
 
     WriteBufferFromOwnString ss;
     response.describe(ss);
